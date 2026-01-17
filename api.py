@@ -201,6 +201,10 @@ def _init_db_pool():
         try:
             # Create a thread-safe connection pool
             _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, database_url)
+            
+            # [CRITICAL] 连接池建立后，立即执行数据库表结构初始化
+            init_db()
+            
         except Exception as e:
             logger.error(f"Failed to initialize database pool: {e}")
             raise
@@ -685,7 +689,7 @@ startup_init()
 # 根路由 - 提供前端HTML文件
 @app.route("/")
 def root():
-    logger.info("根路由被访问 - 返回前端页面")
+    logger.info("通过API访问")
     # index.html 在 API 目录下
     api_dir = Path(__file__).resolve().parent
     response = make_response(send_from_directory(api_dir, 'index.html'))
@@ -886,8 +890,10 @@ def _issue_user_token(conn, user_id: str) -> str:
                 "ON CONFLICT (token_hash) DO UPDATE SET user_id=EXCLUDED.user_id, last_used=NOW()",
                 (th, user_id),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # [FIX] 不再静默失败，而是记录错误并抛出，以便排查
+            logger.error(f"[CRITICAL] Token写入数据库失败: {e}")
+            raise e
 
     conn.commit()
     return token
@@ -1241,6 +1247,7 @@ def api_ping():
 # endregion
 
 # region [ADMIN AUTH]
+
 # 签发管理员Token（7天过期）
 def _issue_admin_token(conn, admin_id: str) -> str:
     token = secrets.token_urlsafe(24)
