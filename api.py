@@ -5670,6 +5670,14 @@ if __name__ == "__main__":
                 sys.stderr.flush()
     
     filtered_log = FilteredLog(None)
+    
+    # [CRITICAL] 启动时初始化数据库（执行自动修复）
+    try:
+        _init_db_pool()
+        print("[INFO] Database initialized successfully.")
+    except Exception as e:
+        print(f"[ERROR] Failed to initialize database: {e}")
+        
     server = pywsgi.WSGIServer(('0.0.0.0', port), app, log=filtered_log)
     print("")
     print(f"API Server Starting on port {port} ")
