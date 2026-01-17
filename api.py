@@ -872,30 +872,44 @@ def _issue_user_token(conn, user_id: str) -> str:
     - 返回明文 Token 由前端保存
     """
     token = secrets.token_urlsafe(24)
-    # 不再尝试读取 auth_token_plain (安全加固)
-
-    # 3) 写入/刷新 hash 记录（不设过期）
     th = hash_token(token)
+    
+    # [FIX] Explicitly initialize cursor outside try block to avoid NameError
     try:
+        cur = conn.cursor()
+    except Exception as e:
+        logger.error(f"[CRITICAL] Failed to create cursor: {e}")
+        raise e
+
+    try:
+        # 3) 写入/刷新 hash 记录（不设过期）
         cur.execute(
             "INSERT INTO user_tokens(token_hash, user_id, last_used, expires_at) VALUES(%s,%s,NOW(),NULL) "
             "ON CONFLICT (token_hash) DO UPDATE SET user_id=EXCLUDED.user_id, last_used=NOW(), expires_at=NULL",
             (th, user_id),
         )
-    except Exception:
+    except Exception as e:
         # 兼容某些旧 schema（没有 expires_at 或冲突规则差异）
+        logger.warning(f"Token insert failed (first attempt): {e}. Retrying with legacy schema...")
         try:
+            conn.rollback() # Ensure transaction is reset
             cur.execute(
                 "INSERT INTO user_tokens(token_hash, user_id, last_used) VALUES(%s,%s,NOW()) "
                 "ON CONFLICT (token_hash) DO UPDATE SET user_id=EXCLUDED.user_id, last_used=NOW()",
                 (th, user_id),
             )
-        except Exception as e:
+        except Exception as retry_e:
             # [FIX] 不再静默失败，而是记录错误并抛出，以便排查
-            logger.error(f"[CRITICAL] Token写入数据库失败: {e}")
-            raise e
+            logger.error(f"[CRITICAL] Token写入数据库失败 (Final): {retry_e}")
+            raise retry_e
 
-    conn.commit()
+    try:
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"[CRITICAL] Token commit failure: {e}")
+        raise e
+        
     return token
 
 
