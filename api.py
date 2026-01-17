@@ -467,6 +467,24 @@ def init_db() -> None:
              cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS salt VARCHAR")
         except:
              pass
+        # [AUTO-REPAIR] 强制重建 user_tokens 表以修复 Token 保存失败问题
+        try:
+            # 检查表结构是否正确（是否存在 expires_at）
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='user_tokens' AND column_name='expires_at'")
+            if not cur.fetchone():
+                logger.warning("[DB FIX] user_tokens table missing 'expires_at'. Recreating...")
+                cur.execute("DROP TABLE IF EXISTS user_tokens CASCADE")
+                cur.execute("""CREATE TABLE user_tokens(
+                    token_hash VARCHAR PRIMARY KEY, 
+                    user_id VARCHAR NOT NULL, 
+                    created TIMESTAMP DEFAULT CURRENT_TIMESTAMP, 
+                    last_used TIMESTAMP, 
+                    expires_at TIMESTAMP, 
+                    FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+                )""")
+        except Exception as e:
+            logger.error(f"[DB FIX] Failed to repair user_tokens: {e}")
+
         cur.execute("""CREATE TABLE IF NOT EXISTS user_tokens(token_hash VARCHAR PRIMARY KEY, user_id VARCHAR NOT NULL, created TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_used TIMESTAMP, expires_at TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE)""")
         
         try:
@@ -533,6 +551,19 @@ def init_db() -> None:
             detail JSONB DEFAULT '{}'::jsonb,
             ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )""")
+        # [AUTO-REPAIR] 修复 system_logs 缺失问题
+        try:
+            cur.execute("""CREATE TABLE IF NOT EXISTS system_logs(
+                id SERIAL PRIMARY KEY,
+                level VARCHAR DEFAULT 'INFO',
+                module VARCHAR,
+                message TEXT,
+                detail JSONB DEFAULT '{}'::jsonb,
+                ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+        except Exception as e:
+             logger.warning(f"[DB FIX] Failed to create system_logs: {e}")
+
         # Record日志表：永久保存
         cur.execute("""CREATE TABLE IF NOT EXISTS system_logs_record(
             id SERIAL PRIMARY KEY,
@@ -1085,8 +1116,12 @@ def login():
         logger.error(f"数据库查询失败: {e}")
         return jsonify({"ok": False, "success": False, "message": "数据库错误"}), 500
 
+    if not u:
+        if conn: conn.close()
+        return jsonify({"ok": False, "success": False, "message": "用户名或密码错误"}), 401
+
     salt = u.get("salt", "")
-    if not u or u.get("pw_hash") != hash_pw(pw, salt):
+    if u.get("pw_hash") != hash_pw(pw, salt):
         if conn: conn.close()
         return jsonify({"ok": False, "success": False, "message": "用户名或密码错误"}), 401
 
@@ -2659,12 +2694,32 @@ def server_manager_login():
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
     # 验证密码
-    pw_hash = _get_setting(cur, "server_manager_pw_hash")
-    if not pw_hash:
-        # 如果数据库未初始化，尝试使用默认 "1" (兼容旧数据)
-        pw_hash = hash_pw("1")
+    # 验证密码
+    pw_hash_stored = _get_setting(cur, "server_manager_pw_hash")
+    
+    # 兼容处理：检查是否是 salted hash (格式: salt$hash)
+    salt = ""
+    if pw_hash_stored and "$" in pw_hash_stored:
+        parts = pw_hash_stored.split("$", 1)
+        if len(parts) == 2:
+            salt = parts[0]
+            expected_hash = parts[1]
+        else:
+            # 异常格式回退
+            salt = "" 
+            expected_hash = pw_hash_stored
+    else:
+         # 旧格式或默认值
+        expected_hash = pw_hash_stored
         
-    ok = (hash_pw(password) == pw_hash)
+    if not expected_hash:
+        # 如果数据库未初始化，尝试使用默认 "1" (兼容旧数据)
+        expected_hash = hash_pw("1")
+        # 如果默认生成的也是带salt的，这里逻辑可能有误，但hash_pw("1")默认无salt(Line 268)
+        # 稳妥起见，如果 settings 没值，我们就假设默认密码是 1 (无盐)
+        salt = ""
+
+    ok = (hash_pw(password, salt) == expected_hash)
     if not ok:
         conn.close()
         return jsonify({"success": False, "message": "密码错误"}), 401
@@ -2706,8 +2761,19 @@ def server_manager_verify():
     conn = db()
     cur = conn.cursor()
     # 验证并支持回退
-    pw_hash = _get_setting(cur, "server_manager_pw_hash") or hash_pw("1")
-    ok = (hash_pw(password) == pw_hash)
+    # 验证密码
+    pw_hash_stored = _get_setting(cur, "server_manager_pw_hash") or hash_pw("1")
+    
+    salt = ""
+    expected_hash = pw_hash_stored
+    
+    if "$" in pw_hash_stored:
+        parts = pw_hash_stored.split("$", 1)
+        if len(parts) == 2:
+            salt = parts[0]
+            expected_hash = parts[1]
+            
+    ok = (hash_pw(password, salt) == expected_hash)
     conn.close()
 
     if ok:
