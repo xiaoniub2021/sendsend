@@ -17367,17 +17367,12 @@
         }
 
         function startTaskStatusCheck(taskId) {
+            // [OPTIMIZATION] 移除轮询，完全依赖 WebSocket 推送
+            // 原有的轮询会增加服务器负担并没有必要
+            console.log(`[发送] 轮询检查已禁用 (taskId: ${taskId}) - 等待 WebSocket 推送...`);
             stopTaskStatusCheck();
             currentTaskId = taskId;
-            taskStatusLastUpdate = Date.now();
-            taskStatusLastProgress = null;
-            taskStatusLastProgressTime = null;
-            let failCount = 0;
-            let backoffMs = 5000; // 初始5秒（仅兜底，不做高频轮询）
-
-            // 兜底轮询：仅用于 WS 异常/漏推时补救
-            // - WS 正常时降低频率，避免把后端打出 524
-            // - 连续失败（含 524）时指数退避并最终熔断停掉轮询
+        }
             const tick = async () => {
                 if (!isSending || !currentTaskId) {
                     stopTaskStatusCheck();

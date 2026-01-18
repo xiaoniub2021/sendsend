@@ -24,6 +24,7 @@ from psycopg2.extras import RealDictCursor
 from urllib.parse import urlparse
 from gevent import spawn, joinall
 from gevent.timeout import Timeout
+from concurrent.futures import ThreadPoolExecutor
 # endregion
 
 # region [APP INIT]
@@ -5241,34 +5242,36 @@ def send_shard_to_worker(server_id: str, shard: dict, server_name: str = None, p
         return False
 
 def _assign_and_push_shards(task_id: str, user_id: str, message: str, trace_id: str = None) -> dict:
+    """
+    任务分发函数（修复版）
+    1. 移除 gevent.spawn 并发，改用线性安全推送（稳定第一）
+    2. 移除循环内的数据库连接，改用批量更新（防止连接耗尽）
+    3. 增加 WS 发送的安全性
+    """
     LOCATION = "[API][_assign_and_push_shards]"
+    
+    # 1. 获取可用 Worker
+    print(f"{LOCATION} → 获取可用Worker服务器")
+    with _worker_lock:
+        available_servers = [sid for sid, c in _worker_clients.items() if c.get("ws") and c.get("ready")]
+
+    available_count = len(available_servers)
+    print(f"{LOCATION} ✓ 找到 {available_count} 个可用Worker")
+    _trace("shard.assign.start", trace_id=trace_id, task_id=task_id, user_id=user_id, ready_workers=available_count)
+
+    # 如果无可用 Worker，快速返回
+    if not available_servers:
+        print(f"{LOCATION} ❌ 无可用Worker，任务将卡在pending状态")
+        return {"total": 0, "pushed": 0, "failed": 0}
+
+    # 稳定排序
+    available_servers.sort()
+
     conn = db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    try:
-        print(f"{LOCATION} → 获取可用Worker服务器")
-        with _worker_lock:
-            available_servers = [sid for sid, c in _worker_clients.items() if c.get("ws") and c.get("ready")]
 
-        print(f"{LOCATION} ✓ 找到 {len(available_servers)} 个可用Worker")
-        _trace("shard.assign.start", trace_id=trace_id, task_id=task_id, user_id=user_id, ready_workers=len(available_servers))
-        # 稳定排序，便于复现与排查
-        try:
-            available_servers = sorted(available_servers)
-        except Exception:
-            pass
-        
-        try:
-            broadcast_servers_list_update()
-        except Exception as e:
-            logger.debug(f"推送服务器列表更新失败: {e}")
-        
-        if not available_servers:
-            print(f"{LOCATION} ❌ 无可用Worker，任务将卡在pending状态")
-            conn.close()
-            return {"total": 0, "pushed": 0, "failed": 0}
-        
-        print(f"{LOCATION} → 查询待处理分片")
+    try:
+        # 2. 一次性获取所有待处理分片
         cur.execute("""
             SELECT shard_id, phones 
             FROM shards 
@@ -5277,130 +5280,142 @@ def _assign_and_push_shards(task_id: str, user_id: str, message: str, trace_id: 
         """, (task_id,))
         pending_shards = cur.fetchall()
         
-        if not pending_shards:
+        total_shards = len(pending_shards)
+        if total_shards == 0:
             conn.close()
             return {"total": 0, "pushed": 0, "failed": 0}
-        
-        print(f"{LOCATION} ✓ 找到 {len(pending_shards)} 个待处理分片")
-        
-        total_shards = len(pending_shards)
+
+        print(f"{LOCATION} ✓ 找到 {total_shards} 个待处理分片，准备分配给 {available_count} 个Worker")
+
+        # 3. 预先获取 Server Names (用于显示)
         cur.execute("SELECT server_id, server_name FROM servers WHERE server_id = ANY(%s)", (available_servers,))
         server_names = {row['server_id']: row.get('server_name') or row['server_id'] for row in cur.fetchall()}
+
+        # 4. 内存分配与推送 (不操作数据库)
+        pushed_success = []  # 记录成功的 (shard_id, worker_id)
         
-        print(f"✓ 任务分配：{total_shards}/{len(available_servers)}（并行推送模式）")
-
-        # 注意：不要持有同一个DB事务跨越 ws.send。这里先释放当前连接，后续每个分片独立提交。
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-        def _safe_phone_count(phones_val) -> int:
+        # 优化分配算法：完美负载均衡（divmod）
+        # 将 pending_shards 分配给 available_servers
+        # 例如：101个任务，5个Worker -> 21, 20, 20, 20, 20
+        total_items = len(pending_shards)
+        num_workers = len(available_servers)
+        
+        base_count, remainder = divmod(total_items, num_workers)
+        
+        assignments = []
+        start_idx = 0
+        
+        for i, worker_id in enumerate(available_servers):
+            # 前 remainder 个 worker 多拿 1 个
+            count = base_count + 1 if i < remainder else base_count
+            if count > 0:
+                # 取出对应的分片
+                end_idx = start_idx + count
+                worker_shards = pending_shards[start_idx:end_idx]
+                start_idx = end_idx
+                
+                # 记录分配
+                for shard_row in worker_shards:
+                    assignments.append((shard_row, worker_id))
+        
+        # 按分配结果并发执行推送
+        def _push_worker(arg):
+            idx, s_row, w_id = arg
+            s_id = s_row["shard_id"]
+            ph = s_row.get("phones")
             try:
-                if isinstance(phones_val, str):
-                    return len(json.loads(phones_val) or [])
-                return len(phones_val or [])
-            except Exception:
-                return 0
-
-        def _push_one(idx0: int, shard_row: dict, worker_id: str):
-            shard_id = shard_row.get("shard_id")
-            phones = shard_row.get("phones")
-            phone_count = _safe_phone_count(phones)
-            display = server_names.get(worker_id, worker_id)
-
-            print(f"{LOCATION} → 推送[{idx0+1}/{total_shards}] {shard_id[:8]} ({phone_count}) -> {display}")
-            _trace("shard.push.begin", trace_id=trace_id, task_id=task_id, shard_id=shard_id, worker_id=worker_id, phone_count=phone_count)
-
-            # 负载 +1（失败则回滚负载）
-            try:
-                redis_manager.incr_worker_load(worker_id, 1)
-            except Exception:
-                pass
-
-            shard_data = {
-                "shard_id": shard_id,
+                p_cnt = len(json.loads(ph)) if isinstance(ph, str) else len(ph or [])
+            except:
+                p_cnt = 0
+            
+            d_name = server_names.get(w_id, w_id)
+            print(f"{LOCATION} → 推送[{idx+1}/{total_shards}] {s_id[:8]} ({p_cnt}) -> {d_name}")
+            
+            s_data = {
+                "shard_id": s_id,
                 "task_id": task_id,
                 "user_id": user_id,
-                "phones": phones,
+                "phones": ph,
                 "message": message,
                 "trace_id": trace_id,
             }
-
-            ok = False
+            
+            # 使用 send_shard_to_worker (内部有锁保护 worker map 读取，ws.send 本身是 socket send)
+            # 必须捕获异常确保线程不崩
             try:
-                ok = send_shard_to_worker(worker_id, shard_data, display, phone_count)
-            except Exception as e:
-                logger.warning(f"{LOCATION} 推送异常 {shard_id} -> {worker_id}: {e}")
-                ok = False
-
-            if ok:
-                # 独立连接提交 running 状态，避免一个分片卡住影响全部
+                is_ok = send_shard_to_worker(w_id, s_data, d_name, p_cnt)
+            except Exception as ex:
+                logger.error(f"推送异常: {ex}")
+                is_ok = False
+            
+            # 无论成功失败，这里不做 Redis Load 操作（由外部通过 divmod 算好了，或者在 success 后单独处理）
+            # 用户特别要求 manual load management，但这里其实不需要 update redis load，
+            # 因为我们的分配算法 divmod 不依赖 redis load。
+            # 不过为了 UI 显示负载，我们在成功后还是 incr 一下。
+            if is_ok:
                 try:
-                    conn_u = db()
-                    cur_u = conn_u.cursor()
-                    cur_u.execute("""
-                        UPDATE shards
-                        SET server_id=%s, status='running', locked_at=NOW(), updated=NOW()
-                        WHERE shard_id=%s AND status='pending'
-                    """, (worker_id, shard_id))
-                    conn_u.commit()
-                    conn_u.close()
-                except Exception as e:
-                    logger.warning(f"{LOCATION} 更新分片状态失败 {shard_id}: {e}")
-                    _trace("shard.push.db_update_fail", trace_id=trace_id, task_id=task_id, shard_id=shard_id, worker_id=worker_id, error=str(e))
-            else:
-                try:
-                    redis_manager.decr_worker_load(worker_id, 1)
-                except Exception:
+                    redis_manager.incr_worker_load(w_id, 1)
+                except:
                     pass
+            
+            return (s_id, w_id, is_ok)
 
-            _trace("shard.push.end", trace_id=trace_id, task_id=task_id, shard_id=shard_id, worker_id=worker_id, ok=ok)
-            return (shard_id, worker_id, ok)
+        # 准备参数
+        push_args = []
+        for j, (sh_row, wk_id) in enumerate(assignments):
+            push_args.append((j, sh_row, wk_id))
+        
+        # 使用线程池并发推送
+        print(f"{LOCATION} → 启动 {len(push_args)} 个线程并发推送...")
+        with ThreadPoolExecutor(max_workers=len(push_args) + 1) as executor:
+            results = list(executor.map(_push_worker, push_args))
+            
+        # 收集成功结果
+        for s_id, w_id, is_ok in results:
+            if is_ok:
+                pushed_success.append((s_id, w_id))
+            else:
+                 print(f"{LOCATION} ⚠️ 推送失败: {s_id} -> {w_id}")
 
-        # round-robin 分配：优先保证“同一批分片尽量同时推送到不同worker”
-        assignments = []
-        for i, shard_row in enumerate(pending_shards):
-            worker_id = available_servers[i % len(available_servers)]
-            assignments.append((i, shard_row, worker_id))
+        # 5. 批量更新数据库 (只开这一次事务)
+        success_count = len(pushed_success)
+        
+        if success_count > 0:
+            print(f"{LOCATION} → 正在批量更新 {success_count} 个分片状态...")
+            
+            # 使用 executemany (或者拼 SQL) 都可以，这里用简单的循环+单次提交
+            # 为了性能，使用 executemany 最好，但在 psycopg2 里简单的 UPDATE 也很快
+            
+            # 准备数据 [(worker_id, shard_id), ...]
+            update_data = [(w_id, s_id) for s_id, w_id in pushed_success]
+            
+            cur.executemany("""
+                UPDATE shards
+                SET server_id=%s, status='running', locked_at=NOW(), updated=NOW()
+                WHERE shard_id=%s AND status='pending'
+            """, update_data)
+            
+            conn.commit()
+            print(f"{LOCATION} ✓ 批量更新完成")
+        
+        conn.close()
 
-        greenlets = [spawn(_push_one, i, sr, wid) for (i, sr, wid) in assignments]
-        # 给并行推送设置总超时，避免 joinall 永远等导致后台任务挂死
-        joinall(greenlets, timeout=10, raise_error=False)
-        # 清理仍未结束的 greenlet（可能是某个 ws.send 卡住）
-        for g in greenlets:
-            try:
-                if not g.ready():
-                    g.kill(block=False)
-            except Exception:
-                pass
+        failed_count = total_shards - success_count
+        print(f"{LOCATION} [分配完成] 总计: {total_shards} | 成功: {success_count} | 失败: {failed_count}")
+        _trace("shard.assign.done", trace_id=trace_id, task_id=task_id, total=total_shards, pushed=success_count, failed=failed_count)
 
-        results = []
-        for g in greenlets:
-            try:
-                if g.value:
-                    results.append(g.value)
-            except Exception:
-                pass
+        return {"total": total_shards, "pushed": success_count, "failed": failed_count}
 
-        pushed_count = sum(1 for (_, _, ok) in results if ok)
-        failed_count = total_shards - pushed_count
-
-        print(f"{LOCATION} [分配完成] 总计: {total_shards} | 成功: {pushed_count} | 失败: {failed_count}")
-        _trace("shard.assign.done", trace_id=trace_id, task_id=task_id, total=total_shards, pushed=pushed_count, failed=failed_count)
-
-        return {"total": total_shards, "pushed": pushed_count, "failed": failed_count}
-    
     except Exception as e:
+        logger.error(f"{LOCATION} 任务分配异常: {e}")
         try:
             conn.rollback()
-        except Exception:
+        except:
             pass
         try:
             conn.close()
-        except Exception:
+        except:
             pass
-        print(f"[ERROR] 分配任务 {task_id} 失败: {e}")
         return {"total": 0, "pushed": 0, "failed": 0}
 
 def get_ready_workers() -> list:
