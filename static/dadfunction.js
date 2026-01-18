@@ -510,16 +510,7 @@ async function _createTask({ message, numbers, taskType = 'normal' }) {
     return data.task_id;
 }
 
-async function _fetchTaskStatus(taskId) {
-    const resp = await fetch(`${API_BASE_URL}/task/${taskId}/status`);
-    let data = null;
-    try { data = await resp.json(); } catch { /* ignore */ }
-    if (!resp.ok || !data || !data.ok) {
-        const msg = (data && (data.message || data.msg)) || `${resp.status} ${resp.statusText}`;
-        throw new Error(`任务状态查询失败：${msg}`);
-    }
-    return data;
-}
+// [DELETED] _fetchTaskStatus - 轮询已移除，使用纯WebSocket模式
 
 async function _waitTaskDone(taskId, totalTasks = 0) {
     if (!activeWs || activeWs.readyState !== WebSocket.OPEN) {
@@ -701,10 +692,8 @@ async function startSending() {
         // 5. 订阅任务状态
         taskTracker.logStep('5. 订阅任务状态', '通过WebSocket订阅更新', LOCATION);
         sendWSCommand('subscribe_task', { task_id: taskId });
-        taskTracker.logStep('✓ 订阅成功', '等待实时更新', LOCATION);
-
-        // 启动状态检查兜底（但不依赖它作为主要反馈）
-        startTaskStatusCheck(taskId);
+        taskTracker.logStep('✓ 订阅成功', '等待实时更新（纯WebSocket模式）', LOCATION);
+        // [MODIFIED] 移除轮询，纯WebSocket等待
 
         const waiter = _ensureTaskWaiter(taskId);
 
@@ -723,7 +712,6 @@ async function startSending() {
 
         taskTracker.finish();
         console.log(`[发送] 任务 ${taskId} 完成`);
-        stopTaskStatusCheck();
     } catch (err) {
         taskTracker.logStep('❌ 任务失败', err.message, LOCATION);
         console.error("[startSending error]", err);
@@ -735,7 +723,6 @@ async function startSending() {
             await customAlert("❌ 发送异常: " + errMsg);
         }
         taskTracker.reset();
-        stopTaskStatusCheck();
     } finally {
         isSending = false;
         updateButtonState();
@@ -753,141 +740,10 @@ function updateButtonState() {
     }
 }
 
-function stopTaskStatusCheck() {
-    if (taskStatusCheckTimer) {
-        clearTimeout(taskStatusCheckTimer);
-        taskStatusCheckTimer = null;
-    }
-    currentTaskId = null;
-    taskStatusLastUpdate = null;
-    taskStatusLastProgress = null;
-    taskStatusLastProgressTime = null;
-}
+// [DELETED] stopTaskStatusCheck() 和 startTaskStatusCheck() - 轮询功能已完全移除
+// 现在使用纯 WebSocket 推送模式，无需轮询
 
-function startTaskStatusCheck(taskId) {
-    stopTaskStatusCheck();
-    currentTaskId = taskId;
-    taskStatusLastUpdate = Date.now();
-    taskStatusLastProgress = null;
-    taskStatusLastProgressTime = null;
-    let failCount = 0;
-    let backoffMs = 5000; // 初始5秒（仅兜底，不做高频轮询）
-
-    // 兜底轮询：仅用于 WS 异常/漏推时补救
-    // - WS 正常时降低频率，避免把后端打出 524
-    // - 连续失败（含 524）时指数退避并最终熔断停掉轮询
-    const tick = async () => {
-        if (!isSending || !currentTaskId) {
-            stopTaskStatusCheck();
-            return;
-        }
-
-        try {
-            const statusData = await _fetchTaskStatus(currentTaskId);
-            const taskStatus = statusData.status;
-            failCount = 0; // 成功一次就清零
-
-            // WS 正常时降低轮询频率
-            const wsOk = (activeWs && activeWs.readyState === WebSocket.OPEN);
-            backoffMs = wsOk ? 15000 : 5000;
-
-            // 如果任务已完成或失败，恢复按钮
-            if (taskStatus === 'done' || taskStatus === 'failed' || taskStatus === 'error') {
-                console.log(`[任务状态检查] 任务 ${currentTaskId} 状态: ${taskStatus}，主动触发完成`);
-
-                // 🔥 关键修复：不要只停定时器，要主动 resolve 主流程的 waiter，
-                // 这样 startSending 里的 await waiter.promise 才能解除阻塞，
-                // 从而正常执行后续的完成逻辑（如打印日志、isSending = false 等）。
-                // 防止出现“轮询查到了完成，但主流程还在死等 WebSocket”的不一致状态。
-
-                if (currentTaskId && _taskWsWaiters.has(currentTaskId)) {
-                    const w = _taskWsWaiters.get(currentTaskId);
-                    _taskWsWaiters.delete(currentTaskId);
-                    try { clearTimeout(w.timeoutId); } catch { /* ignore */ }
-
-                    if (taskStatus === 'done') {
-                        // 构造一个模拟的 payload
-                        const payload = {
-                            task_id: currentTaskId,
-                            status: 'done',
-                            result: statusData.result || {}
-                        };
-                        try { w.resolve(payload); } catch { /* ignore */ }
-                    } else {
-                        try { w.reject(new Error(`任务结束状态: ${taskStatus}`)); } catch { /* ignore */ }
-                    }
-                } else {
-                    // 如果没有 waiter（极少见），那只能手动恢复 UI
-                    isSending = false;
-                    updateButtonState();
-                }
-
-                stopTaskStatusCheck();
-                return;
-            }
-
-            // 如果任务还在运行，检查是否有进展
-            if (taskStatus === 'running' || taskStatus === 'pending') {
-                // 构建当前进度信息（用于比较是否有进展）
-                const currentProgress = {
-                    status: taskStatus,
-                    shards_done: (statusData.shards && statusData.shards.done) || 0,
-                    shards_running: (statusData.shards && statusData.shards.running) || 0,
-                    shards_pending: (statusData.shards && statusData.shards.pending) || 0,
-                    result_success: (statusData.result && statusData.result.success) || 0,
-                    result_fail: (statusData.result && statusData.result.fail) || 0,
-                    result_sent: (statusData.result && statusData.result.sent) || 0
-                };
-
-                // 比较当前进度与上一次进度
-                const progressChanged = !taskStatusLastProgress ||
-                    JSON.stringify(currentProgress) !== JSON.stringify(taskStatusLastProgress);
-
-                if (progressChanged) {
-                    // 有进展，更新进度记录
-                    taskStatusLastProgress = currentProgress;
-                    taskStatusLastProgressTime = Date.now();
-                    // console.log(`[任务状态检查] 任务 ${currentTaskId} 有进展:`, currentProgress);
-                } else {
-                    // 没有进展，但只要状态是 running，我们就信任服务器
-                    // 只有当长时间（例如10秒）连状态都查不到时，_fetchTaskStatus 才会抛错
-                    const now = Date.now();
-                    // 仅仅记录日志，不再自动杀掉任务，防止误杀
-                    // console.log(`[任务状态检查] 任务 ${currentTaskId} 暂无进度更新...`);
-                }
-            }
-        } catch (err) {
-            // 查询失败，不算卡住，继续等待（不恢复按钮）
-            console.error('[任务状态检查] 查询失败（不算卡住，继续等待）:', err);
-            // 查询失败时不恢复按钮，因为无法获取准确信息
-            failCount += 1;
-
-            // 524/超时类错误 -> 快速退避，避免风暴
-            const emsg = String(err && (err.message || err) || '');
-            const is524 = emsg.includes('524') || emsg.includes('status 524');
-
-            if (failCount >= 3) {
-                // 指数退避，上限 60s
-                backoffMs = Math.min(60000, Math.floor(backoffMs * 1.8));
-            }
-
-            if (is524 && failCount >= 5) {
-                console.warn('[任务状态检查] 连续触发 524，停止HTTP轮询，改用 WebSocket 等待（避免压垮后端）');
-                stopTaskStatusCheck();
-                return;
-            }
-        } finally {
-            // 用 setTimeout 而不是 setInterval，避免请求堆叠
-            if (isSending && currentTaskId) {
-                taskStatusCheckTimer = setTimeout(tick, backoffMs);
-            }
-        }
-    };
-
-    // 立刻跑一次（但不会高频刷）
-    taskStatusCheckTimer = setTimeout(tick, 1000);
-}
-//#endregion 发送短信API交互功能模块（零轮询：WebSocket 实时推送）
+//#endregion 发送短信API交互功能模块（纯WebSocket推送模式）
 //#region 收件箱模块（C版面板 - 消息接收和回复）
 function updateNotificationCount() {
     const navInboxBtn = document.getElementById('navInboxBtn');
