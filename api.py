@@ -3782,7 +3782,7 @@ def create_task():
     if request.method == "OPTIONS":
         return jsonify({"ok": True})
 
-    print(f"{LOCATION} → 收到创建任务请求")
+    print(f"[STEP 10][api.py][create_task] → 收到创建任务请求")
     d = _json()
     uid = d.get("user_id")
     msg = d.get("message")
@@ -3849,13 +3849,13 @@ def create_task():
         conn.close()
         return jsonify({"ok": False, "message": "insufficient_credits", "credits": credits, "current": credits, "required": estimated_cost}), 400
 
-    print(f"{LOCATION} → 生成任务ID")
+    print(f"[STEP 11][api.py][create_task] → 生成任务ID")
     task_id = gen_id("task")
-    print(f"{LOCATION} ✓ 任务ID生成: {task_id}")
+    print(f"[STEP 11][api.py][create_task] ✓ 任务ID: {task_id}")
     _trace("task.create.id_generated", trace_id=trace_id, task_id=task_id, user_id=uid)
     
     # 🔥 优化：根据可用服务器数量动态计算shard数量
-    print(f"{LOCATION} → 计算分片数量")
+    print(f"[STEP 12][api.py][create_task] → 查找可用Worker服务器")
     # 先获取可用服务器数量
     # 🔥 快速失败，不阻塞
     # 🔥 核心修正：只认内存中真实的连接
@@ -3866,6 +3866,7 @@ def create_task():
         logger.info(f"{LOCATION} 从内存获取到 {len(available_servers)} 个活跃 Worker")
     
     available_count = len(available_servers) if available_servers else 0
+    print(f"[STEP 12][api.py][create_task] ✓ 找到 {available_count} 个可用Worker")
     
     print(f"{LOCATION} 📥 任务 {task_id[:8]}... | 号码: {len(nums)} | 可用服务器: {available_count}")
     
@@ -3941,7 +3942,7 @@ def create_task():
             conn2 = db()
             cur2 = conn2.cursor()
             
-            print(f"{LOCATION} → 后台创建分片 (shard_size={shard_size})")
+            print(f"[STEP 13][api.py][async_create_shards_and_assign] → 后台创建分片 (shard_size={shard_size})")
             actual_shard_count = 0
             shard_ids = []  # 记录所有分片ID
             
@@ -3957,7 +3958,7 @@ def create_task():
                 _trace("shard.created", trace_id=trace_id, task_id=task_id, shard_id=shard_id, phone_count=phone_count)
             
             conn2.commit()
-            print(f"{LOCATION} ✓ 后台创建了 {actual_shard_count} 个分片")
+            print(f"[STEP 13][api.py][async_create_shards_and_assign] ✓ 创建了 {actual_shard_count} 个分片")
             _trace("shard.create.commit", trace_id=trace_id, task_id=task_id, shard_count=actual_shard_count)
             
             # [NEW] 在内存追踪器中注册任务
@@ -3971,17 +3972,17 @@ def create_task():
                     "trace_id": trace_id,
                     "message": msg
                 }
-            print(f"{LOCATION} ✓ 任务已注册到内存追踪器")
+            print(f"[STEP 14][api.py][async_create_shards_and_assign] ✓ 任务注册到内存追踪器")
             
             logger.info(f"{LOCATION} 任务 {task_id} 开始分配分片，用户: {uid}, 号码数: {len(nums)}")
-            print(f"{LOCATION} → 调用 _assign_and_push_shards")
+            print(f"[STEP 15][api.py][_assign_and_push_shards] → 开始分配分片到Worker")
             assign_result = _assign_and_push_shards(task_id, uid, msg, trace_id=trace_id)
             _trace("shard.assign.result", trace_id=trace_id, task_id=task_id, **assign_result)
             
             if assign_result.get("pushed", 0) > 0:
                 cur2.execute("UPDATE tasks SET status='running', updated=NOW() WHERE task_id=%s", (task_id,))
                 conn2.commit()
-                print(f"任务成功分配  worker开始执行  等待任务结果...")
+                print(f"[STEP 16][api.py][_assign_and_push_shards] ✓ 分片已推送到Worker，等待执行结果...")
                 _trace("task.status.running", trace_id=trace_id, task_id=task_id)
             
             conn2.close()
@@ -4079,7 +4080,7 @@ def reports_collection():
 
 def report_shard_result(shard_id: str, sid: str, uid: str, suc: int, fail: int, detail: dict):
     LOCATION = "[API][report_shard_result]"
-    print(f"{LOCATION} → 收到分片结果: shard_id={shard_id}, 成功={suc}, 失败={fail}")
+    print(f"[STEP 20][api.py][report_shard_result] → 收到分片结果: shard_id={shard_id[:8] if shard_id else 'N/A'}..., 成功={suc}, 失败={fail}")
     trace_id = None
     task_id_from_tracker = None
     task_completed_by_tracker = False
@@ -4100,11 +4101,11 @@ def report_shard_result(shard_id: str, sid: str, uid: str, suc: int, fail: int, 
                     tracker["shard_results"][shard_id] = {"success": suc, "fail": fail}
                     tracker["completed_shards"] += 1
                     task_id_from_tracker = tid
-                    print(f"{LOCATION} 📊 内存追踪: 任务 {tid} 完成 {tracker['completed_shards']}/{tracker['total_shards']} 分片")
+                    print(f"[STEP 20][api.py][report_shard_result] 📊 内存追踪: 任务 {tid[:8]}... 完成 {tracker['completed_shards']}/{tracker['total_shards']} 分片")
                     
                     if tracker["completed_shards"] >= tracker["total_shards"]:
                         task_completed_by_tracker = True
-                        print(f"{LOCATION} ✅ 内存追踪: 任务 {tid} 所有分片已完成！")
+                        print(f"[STEP 21][api.py][report_shard_result] ✅ 内存追踪: 任务 {tid[:8]}... 所有分片已完成！")
                 break
     
     sent = suc + fail
@@ -5357,7 +5358,10 @@ def _assign_and_push_shards(task_id: str, user_id: str, message: str, trace_id: 
             except Exception:
                 return 0
 
+
+
         def _push_one(idx0: int, shard_row: dict, worker_id: str):
+            LOCATION = "[API][_assign_and_push_shards][_push_one]"
             shard_id = shard_row.get("shard_id")
             phones = shard_row.get("phones")
             phone_count = _safe_phone_count(phones)
@@ -5382,8 +5386,12 @@ def _assign_and_push_shards(task_id: str, user_id: str, message: str, trace_id: 
             }
 
             ok = False
+            conn_u = None # 初始化连接变量，以便在 finally 中使用
+
             try:
-                # 防止 ws.send 卡死拖垮整个进程（524 / 页面打不开的典型原因）
+                # 🔧 关键修复：防止 ws.send 卡死拖垮整个进程
+                # 设置 3 秒超时，避免网络慢导致阻塞
+                from gevent import Timeout
                 with Timeout(3):
                     # 重要：不要在持有 _worker_lock 的情况下执行 ws.send（可能阻塞，影响其他worker状态更新）
                     with _worker_lock:
@@ -5395,46 +5403,59 @@ def _assign_and_push_shards(task_id: str, user_id: str, message: str, trace_id: 
                             logger.warning(f"{LOCATION} Worker {worker_id} 未就绪")
                             return False
                         ws = client.get("ws")
+                    
                     ws.send(json.dumps({"type": "shard_run", "shard": shard_data}))
-                print(f"{LOCATION} ✓ 分片 {shard_id}... 已推送到Worker {worker_id}")
+                
+                print(f"{LOCATION} ✓ 分片 {shard_id}... 已推送到 Worker {worker_id}")
                 print(f"→ {display:8} : {shard_id}  ({phone_count})")
                 ok = True
+                
             except Timeout:
                 logger.error(f"{LOCATION} 发送超时(3s): worker={worker_id}, shard={shard_id}")
-                # 超时的 ws 很可能已不健康，尽量从内存里剔除，等待worker自动重连
+                # 超时的 ws 很可能已不健康，尝试从内存里剔除
                 try:
                     with _worker_lock:
                         _worker_clients.pop(worker_id, None)
                 except Exception:
                     pass
                 ok = False
+                
             except Exception as e:
                 logger.error(f"{LOCATION} 发送失败: {e}")
                 ok = False
 
-            if ok:
-                # 独立连接提交 running 状态，避免一个分片卡住影响全部
-                try:
-                    conn_u = db()
-                    cur_u = conn_u.cursor()
-                    cur_u.execute("""
-                        UPDATE shards
-                        SET server_id=%s, status='running', locked_at=NOW(), updated=NOW()
-                        WHERE shard_id=%s AND status='pending'
-                    """, (worker_id, shard_id))
-                    conn_u.commit()
-                    conn_u.close()
-                except Exception as e:
-                    logger.warning(f"{LOCATION} 更新分片状态失败 {shard_id}: {e}")
-                    _trace("shard.push.db_update_fail", trace_id=trace_id, task_id=task_id, shard_id=shard_id, worker_id=worker_id, error=str(e))
-            else:
-                try:
-                    redis_manager.decr_worker_load(worker_id, 1)
-                except Exception:
-                    pass
+            finally:
+                if ok:
+                    # ✅ 推送成功，更新数据库状态
+                    try:
+                        conn_u = db()
+                        cur_u = conn_u.cursor()
+                        cur_u.execute("""
+                            UPDATE shards
+                            SET server_id=%s, status='running', locked_at=NOW(), updated=NOW()
+                            WHERE shard_id=%s AND status='pending'
+                        """, (worker_id, shard_id))
+                        conn_u.commit()
+                    except Exception as e:
+                        logger.warning(f"{LOCATION} 更新分片状态失败 {shard_id}: {e}")
+                        _trace("shard.push.db_update_fail", trace_id=trace_id, task_id=task_id, shard_id=shard_id, worker_id=worker_id, error=str(e))
+                    finally:
+                        # 🔧 [CRITICAL FIX] 核心修复：确保连接关闭，防止连接泄漏导致后续请求卡死
+                        if conn_u:
+                            try:
+                                conn_u.close()
+                            except Exception:
+                                pass
+                else:
+                    # ✅ 推送失败，回滚负载
+                    try:
+                        redis_manager.decr_worker_load(worker_id, 1)
+                    except Exception:
+                        pass
 
             _trace("shard.push.end", trace_id=trace_id, task_id=task_id, shard_id=shard_id, worker_id=worker_id, ok=ok)
             return (shard_id, worker_id, ok)
+
 
         # round-robin 分配：优先保证“同一批分片尽量同时推送到不同worker”
         assignments = []
@@ -5443,9 +5464,12 @@ def _assign_and_push_shards(task_id: str, user_id: str, message: str, trace_id: 
             assignments.append((i, shard_row, worker_id))
 
         greenlets = [spawn(_push_one, i, sr, wid) for (i, sr, wid) in assignments]
-        # 给并行推送设置总超时，避免 joinall 永远等导致后台任务挂死
- 
-        # 清理仍未结束的 greenlet（可能是某个 ws.send 卡住）
+        
+        # 等待所有greenlet完成，设置5秒总超时避免永久等待
+        from gevent import joinall
+        joinall(greenlets, timeout=30)
+        
+        # 清理仍未结束的 greenlet（超时后）
         for g in greenlets:
             try:
                 if not g.ready():
@@ -5456,12 +5480,14 @@ def _assign_and_push_shards(task_id: str, user_id: str, message: str, trace_id: 
         results = []
         for g in greenlets:
             try:
-                if g.value:
-                    results.append(g.value)
+                val = g.value
+                # 确保结果是元组格式 (shard_id, worker_id, ok)
+                if val and isinstance(val, tuple) and len(val) == 3:
+                    results.append(val)
             except Exception:
                 pass
 
-        pushed_count = sum(1 for (_, _, ok) in results if ok)
+        pushed_count = sum(1 for r in results if r[2])  # r[2] = ok
         failed_count = total_shards - pushed_count
 
         print(f"{LOCATION} [分配完成] 总计: {total_shards} | 成功: {pushed_count} | 失败: {failed_count}")
